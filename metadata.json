@@ -1,0 +1,6 @@
+{
+  "name": "Cognex DM 262X & Printer Controller",
+  "description": "Industrial control interface connecting to Cognex DataMan 262X camera via Telnet and network printer with automated scan-to-print workflow.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
