@@ -577,7 +577,7 @@ export default function App() {
         />
 
       {/* Main Workspace */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 space-y-5">
+      <main className="flex-1 w-full p-4 sm:p-6 space-y-5">
         <div className="lg:hidden flex gap-2 overflow-x-auto pb-1">
           <button
             onClick={() => setActiveView('overview')}
@@ -670,7 +670,8 @@ export default function App() {
           </div>
         </div>
 
-        <div className="bg-slate-900/70 rounded-xl border border-slate-800 overflow-hidden">
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1.2fr)_minmax(360px,0.8fr)] gap-5 items-start">
+        <div className="min-w-0 bg-slate-900/70 rounded-xl border border-slate-800 overflow-hidden">
           <div className="p-4 border-b border-slate-800 flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3">
             <div>
               <div className="flex items-center gap-2 text-xs font-mono text-cyan-300">
@@ -691,7 +692,7 @@ export default function App() {
             </button>
           </div>
 
-          <div className="p-4 grid grid-cols-1 xl:grid-cols-[360px_1fr] gap-4">
+          <div className="p-4 grid grid-cols-1 gap-4">
             <div className="space-y-3">
               <label className="block text-xs text-slate-400">
                 Recipe
@@ -906,7 +907,7 @@ export default function App() {
 
         {/* Cognex DM 262X Camera */}
         {state ? (
-          <div className="grid grid-cols-1 gap-5">
+          <div className="min-w-0">
             <CognexPanel
               device={state.cognex}
               onTrigger={handleTriggerCognex}
@@ -925,6 +926,7 @@ export default function App() {
             </p>
           </div>
         )}
+        </div>
 
         {/* Industrial Integration Guide Callout */}
         <div className="bg-slate-900/40 rounded-xl border border-slate-800/80 p-4 text-xs text-slate-400 space-y-2">

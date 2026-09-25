@@ -13,6 +13,7 @@ import {
   SystemState,
   BarcodeRead,
   PrintJob,
+  PrinterProtocol,
   TelnetLogEntry,
 } from './src/types';
 
@@ -20,8 +21,8 @@ dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const DEFAULT_PRINTER_HOST = '192.168.1.5';
-const DEFAULT_PRINTER_PORT = 9944;
+const DEFAULT_PRINTER_HOST = process.env.PRINTER_HOST || '192.168.1.6';
+const DEFAULT_PRINTER_PORT = Number(process.env.PRINTER_PORT || 9944);
 const DEFAULT_COGNEX_HOST = process.env.COGNEX_HOST || '169.254.76.4';
 const DEFAULT_COGNEX_PORT = Number(process.env.COGNEX_PORT || 23);
 const MAX_PRINTER_RESPONSE_BYTES = 5 * 1024 * 1024;
@@ -49,6 +50,9 @@ type RecipeFieldInput = {
 
 let mysqlPool: mysql.Pool | null = null;
 let recipeSchemaReady: Promise<void> | null = null;
+let deviceSettingsSchemaReady: Promise<void> | null = null;
+
+type DeviceSettingKey = 'cognex' | 'printer';
 
 function getMysqlPool() {
   if (mysqlPool) return mysqlPool;
@@ -67,6 +71,47 @@ function getMysqlPool() {
     namedPlaceholders: true,
   });
   return mysqlPool;
+}
+
+async function ensureDeviceSettingsSchema() {
+  if (!deviceSettingsSchemaReady) {
+    deviceSettingsSchemaReady = (async () => {
+      const pool = getMysqlPool();
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS device_settings (
+          device_key VARCHAR(32) NOT NULL PRIMARY KEY,
+          config_json JSON NOT NULL,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+      `);
+    })().catch((error) => {
+      deviceSettingsSchemaReady = null;
+      throw error;
+    });
+  }
+  return deviceSettingsSchemaReady;
+}
+
+async function readDeviceSettings(deviceKey: DeviceSettingKey) {
+  await ensureDeviceSettingsSchema();
+  const [rows] = await getMysqlPool().query<any[]>(
+    'SELECT config_json AS configJson FROM device_settings WHERE device_key = ?',
+    [deviceKey],
+  );
+  const value = rows[0]?.configJson;
+  if (!value) return null;
+  return typeof value === 'string' ? JSON.parse(value) : value;
+}
+
+async function saveDeviceSettings(deviceKey: DeviceSettingKey, config: object) {
+  await ensureDeviceSettingsSchema();
+  await getMysqlPool().query(
+    `INSERT INTO device_settings (device_key, config_json)
+     VALUES (?, ?)
+     ON DUPLICATE KEY UPDATE config_json = VALUES(config_json), updated_at = CURRENT_TIMESTAMP`,
+    [deviceKey, JSON.stringify(config)],
+  );
 }
 
 function getCognexImageDirectory() {
@@ -671,11 +716,11 @@ let cognexState: CognexDeviceState = {
   config: {
     host: DEFAULT_COGNEX_HOST,
     port: DEFAULT_COGNEX_PORT,
-    user: 'admin',
-    password: '',
-    timeoutMs: 4000,
-    isSimulated: false,
-    autoReconnect: true,
+    user: process.env.COGNEX_USER || 'admin',
+    password: process.env.COGNEX_PASSWORD || '',
+    timeoutMs: Number(process.env.COGNEX_TIMEOUT_MS || 4000),
+    isSimulated: process.env.COGNEX_SIMULATED === 'true',
+    autoReconnect: process.env.COGNEX_AUTO_RECONNECT !== 'false',
     ftpImageDirectory: process.env.COGNEX_FTP_IMAGE_DIR || DEFAULT_COGNEX_FTP_IMAGE_DIR,
   },
   deviceName: 'Cognex DataMan 262X (Line-01)',
@@ -739,15 +784,15 @@ let printerState: PrinterDeviceState = {
   config: {
     host: DEFAULT_PRINTER_HOST,
     port: DEFAULT_PRINTER_PORT,
-    protocol: 'TCP_JSON',
-    timeoutMs: 4000,
-    isSimulated: false,
-    autoReconnect: true,
-    labelWidthMm: 100,
-    labelHeightMm: 50,
-    dpi: 300,
-    messageName: '',
-    dynamicFieldName: 'dynamic_text',
+    protocol: (process.env.PRINTER_PROTOCOL || 'TCP_JSON') as PrinterProtocol,
+    timeoutMs: Number(process.env.PRINTER_TIMEOUT_MS || 4000),
+    isSimulated: process.env.PRINTER_SIMULATED === 'true',
+    autoReconnect: process.env.PRINTER_AUTO_RECONNECT !== 'false',
+    labelWidthMm: Number(process.env.PRINTER_LABEL_WIDTH_MM || 100),
+    labelHeightMm: Number(process.env.PRINTER_LABEL_HEIGHT_MM || 50),
+    dpi: Number(process.env.PRINTER_DPI || 300) as 203 | 300 | 600,
+    messageName: process.env.PRINTER_MESSAGE_NAME || '',
+    dynamicFieldName: process.env.PRINTER_DYNAMIC_FIELD_NAME || 'dynamic_text',
   },
   printerModel: 'Sojet TCP-JSON Industrial Printer',
   isHeadOpen: false,
@@ -776,6 +821,67 @@ let printerState: PrinterDeviceState = {
   ],
   totalJobsPrinted: 1,
 };
+
+function boundedNumber(value: unknown, fallback: number, minimum: number, maximum: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
+function settingBoolean(value: unknown, fallback: boolean) {
+  return value === undefined ? fallback : Boolean(value);
+}
+
+function normalizeCognexConfig(input: any, base = cognexState.config): typeof cognexState.config {
+  return {
+    ...base,
+    host: String(input?.host || base.host).trim(),
+    port: boundedNumber(input?.port, base.port, 1, 65535),
+    user: input?.user === undefined ? base.user : String(input.user),
+    password: input?.password === undefined ? base.password : String(input.password),
+    timeoutMs: boundedNumber(input?.timeoutMs, base.timeoutMs, 250, 120000),
+    isSimulated: settingBoolean(input?.isSimulated, base.isSimulated),
+    autoReconnect: settingBoolean(input?.autoReconnect, base.autoReconnect),
+    ftpImageDirectory: input?.ftpImageDirectory === undefined
+      ? base.ftpImageDirectory
+      : String(input.ftpImageDirectory).trim(),
+  };
+}
+
+function normalizePrinterConfig(input: any, base = printerState.config): typeof printerState.config {
+  const protocol = String(input?.protocol || base.protocol).toUpperCase();
+  const dpi = Number(input?.dpi ?? base.dpi);
+  return {
+    ...base,
+    host: String(input?.host || base.host).trim(),
+    port: boundedNumber(input?.port, base.port, 1, 65535),
+    protocol: (['TCP_JSON', 'ZPL', 'ESC-POS', 'RAW_TEXT'].includes(protocol) ? protocol : base.protocol) as PrinterProtocol,
+    timeoutMs: boundedNumber(input?.timeoutMs, base.timeoutMs, 250, 120000),
+    isSimulated: settingBoolean(input?.isSimulated, base.isSimulated),
+    autoReconnect: settingBoolean(input?.autoReconnect, base.autoReconnect),
+    labelWidthMm: boundedNumber(input?.labelWidthMm, base.labelWidthMm, 1, 1000),
+    labelHeightMm: boundedNumber(input?.labelHeightMm, base.labelHeightMm, 1, 1000),
+    dpi: ([203, 300, 600].includes(dpi) ? dpi : base.dpi) as 203 | 300 | 600,
+    messageName: input?.messageName === undefined ? base.messageName : String(input.messageName),
+    dynamicFieldName: input?.dynamicFieldName === undefined ? base.dynamicFieldName : String(input.dynamicFieldName),
+  };
+}
+
+async function loadPersistedDeviceSettings() {
+  try {
+    const [cognexConfig, printerConfig] = await Promise.all([
+      readDeviceSettings('cognex'),
+      readDeviceSettings('printer'),
+    ]);
+    if (cognexConfig) {
+      cognexState.config = normalizeCognexConfig(cognexConfig);
+      cognexState.ipAddress = cognexState.config.host;
+    }
+    if (printerConfig) printerState.config = normalizePrinterConfig(printerConfig);
+    console.log(`Device settings loaded (${cognexConfig ? 'Cognex DB' : 'Cognex .env'}, ${printerConfig ? 'Printer DB' : 'Printer .env'}).`);
+  } catch (error: any) {
+    console.warn(`Device settings database unavailable; using .env defaults: ${error.message}`);
+  }
+}
 
 let pipelineState: ScanToPrintPipeline = {
   enabled: true,
@@ -1737,18 +1843,15 @@ app.get('/api/system/state', (req, res) => {
 });
 
 // Cognex routes
-app.post('/api/cognex/connect', (req, res) => {
-  const { host, port, user, password, isSimulated, timeoutMs } = req.body;
-  connectCognex({
-    ...cognexState.config,
-    host: host || cognexState.config.host,
-    port: Number(port) || cognexState.config.port,
-    user: user !== undefined ? user : cognexState.config.user,
-    password: password !== undefined ? password : cognexState.config.password,
-    isSimulated: isSimulated !== undefined ? Boolean(isSimulated) : cognexState.config.isSimulated,
-    timeoutMs: Number(timeoutMs) || 5000,
-  });
-  res.json({ success: true, status: cognexState.status });
+app.post('/api/cognex/connect', async (req, res) => {
+  try {
+    const config = normalizeCognexConfig(req.body);
+    await saveDeviceSettings('cognex', config);
+    connectCognex(config);
+    res.json({ success: true, status: cognexState.status, config });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: `Could not save Cognex settings: ${err.message}` });
+  }
 });
 
 app.post('/api/cognex/disconnect', (req, res) => {
@@ -1818,9 +1921,16 @@ app.post('/api/cognex/send', (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/cognex/config', (req, res) => {
-  cognexState.config = { ...cognexState.config, ...req.body };
-  res.json({ success: true, config: cognexState.config });
+app.post('/api/cognex/config', async (req, res) => {
+  try {
+    const config = normalizeCognexConfig(req.body);
+    await saveDeviceSettings('cognex', config);
+    cognexState.config = config;
+    cognexState.ipAddress = config.host;
+    res.json({ success: true, config });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: `Could not save Cognex settings: ${err.message}` });
+  }
 });
 
 app.get('/api/cognex/images', (req, res) => {
@@ -1856,18 +1966,14 @@ app.get('/api/cognex/image/:filename', (req, res) => {
 
 // Printer routes
 app.post('/api/printer/connect', async (req, res) => {
-  const { host, port, protocol, isSimulated, timeoutMs, messageName, dynamicFieldName } = req.body;
-  await connectPrinter({
-    ...printerState.config,
-    host: host || printerState.config.host,
-    port: Number(port) || printerState.config.port,
-    protocol: protocol || printerState.config.protocol,
-    isSimulated: isSimulated !== undefined ? Boolean(isSimulated) : printerState.config.isSimulated,
-    timeoutMs: Number(timeoutMs) || 5000,
-    messageName: messageName !== undefined ? messageName : printerState.config.messageName,
-    dynamicFieldName: dynamicFieldName !== undefined ? dynamicFieldName : printerState.config.dynamicFieldName,
-  });
-  res.json({ success: true, status: printerState.status });
+  try {
+    const config = normalizePrinterConfig(req.body);
+    await saveDeviceSettings('printer', config);
+    await connectPrinter(config);
+    res.json({ success: true, status: printerState.status, config });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: `Could not save printer settings: ${err.message}` });
+  }
 });
 
 app.post('/api/printer/disconnect', (req, res) => {
@@ -1910,9 +2016,15 @@ app.post('/api/printer/test-print', async (req, res) => {
   res.json({ success: true, job });
 });
 
-app.post('/api/printer/config', (req, res) => {
-  printerState.config = { ...printerState.config, ...req.body };
-  res.json({ success: true, config: printerState.config });
+app.post('/api/printer/config', async (req, res) => {
+  try {
+    const config = normalizePrinterConfig(req.body);
+    await saveDeviceSettings('printer', config);
+    printerState.config = config;
+    res.json({ success: true, config });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: `Could not save printer settings: ${err.message}` });
+  }
 });
 
 app.get('/api/printer/status', async (req, res) => {
@@ -2297,6 +2409,8 @@ app.post('/api/logs/clear', (req, res) => {
 // ---------------- SERVER BOOTSTRAP ----------------
 
 async function startServer() {
+  await loadPersistedDeviceSettings();
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },

@@ -102,7 +102,7 @@ export const CognexPanel = ({
   ];
 
   return (
-    <div className="bg-slate-900/90 rounded-xl border border-slate-800 shadow-xl overflow-hidden flex flex-col h-full">
+    <div className="bg-slate-900/90 rounded-xl border border-slate-800 shadow-xl overflow-hidden flex flex-col h-full lg:h-[calc(100vh-7rem)] lg:max-h-[900px]">
       {/* Panel Header */}
       <div className="bg-slate-850 px-4 py-3 border-b border-slate-800 flex items-center justify-between">
         <div className="flex items-center gap-2.5">
@@ -224,7 +224,7 @@ export const CognexPanel = ({
       )}
 
       {/* Main Body */}
-      <div className="p-4 space-y-4 flex-1 flex flex-col overflow-y-auto">
+      <div className="p-4 space-y-4 flex-1 min-h-0 flex flex-col overflow-y-auto overscroll-contain">
         {/* Optical Aiming Field & Trigger Controller */}
         <div className="relative bg-slate-950 rounded-lg border border-slate-800 p-4 overflow-hidden group">
           {/* Aiming Reticle Canvas simulation */}
@@ -476,7 +476,7 @@ export const CognexPanel = ({
         </div>
 
         {/* Telemetry Stats */}
-        <div className="grid grid-cols-3 gap-2 text-center text-xs">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-xs">
           <div className="bg-slate-950 p-2 rounded border border-slate-800">
             <div className="text-slate-500 text-[10px] uppercase">Triggers</div>
             <div className="font-mono text-sm font-bold text-white">{device?.totalTriggers || 0}</div>
@@ -486,10 +486,14 @@ export const CognexPanel = ({
             <div className="font-mono text-sm font-bold text-emerald-400">{device?.goodReads || 0}</div>
           </div>
           <div className="bg-slate-950 p-2 rounded border border-slate-800">
+            <div className="text-slate-500 text-[10px] uppercase">No Reads</div>
+            <div className="font-mono text-sm font-bold text-rose-400">{device?.noReads || 0}</div>
+          </div>
+          <div className="bg-slate-950 p-2 rounded border border-slate-800">
             <div className="text-slate-500 text-[10px] uppercase">Read Rate</div>
             <div className="font-mono text-sm font-bold text-amber-400">
-              {device?.totalTriggers > 0
-                ? `${Math.round((device.goodReads / device.totalTriggers) * 100)}%`
+              {(device?.goodReads || 0) + (device?.noReads || 0) > 0
+                ? `${Math.round(((device?.goodReads || 0) / ((device?.goodReads || 0) + (device?.noReads || 0))) * 100)}%`
                 : '100%'}
             </div>
           </div>
