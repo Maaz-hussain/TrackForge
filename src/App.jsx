@@ -36,6 +36,9 @@ export default function App() {
   const [recipeSerials, setRecipeSerials] = useState([]);
   const [recipeBatchSize, setRecipeBatchSize] = useState('1');
   const [printExistingOnly, setPrintExistingOnly] = useState(true);
+  const [continuousPrint, setContinuousPrint] = useState(false);
+  const [printsPerSecond, setPrintsPerSecond] = useState('1');
+  const [continuousJob, setContinuousJob] = useState(null);
   const [recipeBusy, setRecipeBusy] = useState('');
   const [printerQueue, setPrinterQueue] = useState(null);
   const [printerQueueBusy, setPrinterQueueBusy] = useState(false);
@@ -458,16 +461,38 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           quantity: Number(recipeBatchSize) || 1,
-          useExistingOnly: printExistingOnly,
+          useExistingOnly: continuousPrint ? false : printExistingOnly,
+          continuousPrint,
+          printsPerSecond: Number(printsPerSecond) || 1,
           fieldOverrides: recipeSelectionValues,
         }),
       });
       const value = await res.json();
       if (!res.ok) throw new Error(value.error || 'Could not print batch');
-      setNotice(`Printed ${value.printed}/${value.requested} recipe messages.`);
+      if (value.continuous && value.job) {
+        setContinuousJob(value.job);
+        setNotice(`Continuous print started for ${value.job.requested} codes at ${value.job.printsPerSecond} per second.`);
+      } else {
+        setNotice(`Printed ${value.printed}/${value.requested} recipe messages.`);
+      }
       await loadRecipeSerials(selectedRecipeId);
       await loadPrinterQueue();
       fetchState();
+    } catch (err) {
+      setNotice(err.message);
+    } finally {
+      setRecipeBusy('');
+    }
+  };
+
+  const handleCancelContinuousPrint = async () => {
+    setRecipeBusy('cancelContinuous');
+    try {
+      const res = await fetch('/api/printer/continuous-job/cancel', { method: 'POST' });
+      const value = await res.json();
+      if (!res.ok) throw new Error(value.error || 'Could not stop continuous printing');
+      setContinuousJob(value.job);
+      setNotice('Continuous printing is stopping. Unsent codes will return to generated status.');
     } catch (err) {
       setNotice(err.message);
     } finally {
@@ -496,6 +521,26 @@ export default function App() {
     const timer = setInterval(refreshSerials, 2000);
     return () => clearInterval(timer);
   }, [activeView, selectedRecipeId]);
+
+  useEffect(() => {
+    if (activeView !== 'overview') return undefined;
+    let disposed = false;
+    const refreshContinuousJob = async () => {
+      try {
+        const res = await fetch('/api/printer/continuous-job');
+        const value = await res.json();
+        if (!disposed && res.ok) setContinuousJob(value.job || null);
+      } catch {
+        // Main polling and action handlers surface connection errors.
+      }
+    };
+    refreshContinuousJob();
+    const timer = setInterval(refreshContinuousJob, 750);
+    return () => {
+      disposed = true;
+      clearInterval(timer);
+    };
+  }, [activeView]);
 
   const selectedRecipe = overviewRecipes.find((recipe) => String(recipe.id) === String(selectedRecipeId));
 
@@ -725,7 +770,7 @@ export default function App() {
                 <div className="flex items-end gap-2">
                   <button
                     onClick={handleGenerateRecipeBatch}
-                    disabled={!selectedRecipeId}
+                    disabled={!selectedRecipeId || continuousJob?.status === 'running'}
                     className="px-3 py-2 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-xs text-slate-200 disabled:opacity-50 flex items-center gap-1.5"
                   >
                     {recipeBusy === 'generate' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Database className="w-3.5 h-3.5" />}
@@ -733,24 +778,88 @@ export default function App() {
                   </button>
                   <button
                     onClick={handlePrintRecipeBatch}
-                    disabled={!selectedRecipeId || !selectedRecipeDetail || state?.printer?.status !== 'connected'}
+                    disabled={!selectedRecipeId || !selectedRecipeDetail || state?.printer?.status !== 'connected' || continuousJob?.status === 'running'}
                     className="px-3 py-2 rounded bg-cyan-600 hover:bg-cyan-500 text-white text-xs disabled:opacity-50 flex items-center gap-1.5"
                   >
                     {recipeBusy === 'print' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
-                    Print
+                    {continuousPrint ? 'Start' : 'Print'}
                   </button>
                 </div>
               </div>
 
-              <label className="flex items-center gap-2 text-xs text-slate-300 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2">
-                <input
-                  type="checkbox"
-                  checked={printExistingOnly}
-                  onChange={(event) => setPrintExistingOnly(event.target.checked)}
-                  className="rounded border-slate-700 bg-slate-900 text-cyan-500 focus:ring-cyan-500"
-                />
-                <span>Print only serials already in generated status</span>
-              </label>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <label className="flex items-center gap-2 text-xs text-slate-300 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={continuousPrint}
+                    onChange={(event) => setContinuousPrint(event.target.checked)}
+                    disabled={continuousJob?.status === 'running'}
+                    className="rounded border-slate-700 bg-slate-900 text-cyan-500 focus:ring-cyan-500 disabled:opacity-50"
+                  />
+                  <span>Continuous print</span>
+                </label>
+                <label className={`flex items-center justify-between gap-3 text-xs bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 ${continuousPrint ? 'text-slate-300' : 'text-slate-600'}`}>
+                  <span>Prints per second</span>
+                  <input
+                    type="number"
+                    min="1"
+                    max="50"
+                    value={printsPerSecond}
+                    onChange={(event) => setPrintsPerSecond(event.target.value)}
+                    disabled={!continuousPrint || continuousJob?.status === 'running'}
+                    className="w-20 bg-slate-900 border border-slate-700 rounded px-2 py-1 text-right text-white font-mono focus:border-cyan-500 focus:outline-none disabled:opacity-40"
+                  />
+                </label>
+              </div>
+
+              {!continuousPrint && (
+                <label className="flex items-center gap-2 text-xs text-slate-300 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={printExistingOnly}
+                    onChange={(event) => setPrintExistingOnly(event.target.checked)}
+                    className="rounded border-slate-700 bg-slate-900 text-cyan-500 focus:ring-cyan-500"
+                  />
+                  <span>Print only serials already in generated status</span>
+                </label>
+              )}
+
+              {continuousJob && (
+                <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[10px] uppercase text-slate-500 font-mono">Continuous Print</div>
+                      <div className="mt-1 text-slate-200">
+                        {continuousJob.processed}/{continuousJob.requested} processed at {continuousJob.printsPerSecond}/sec
+                      </div>
+                    </div>
+                    {continuousJob.status === 'running' ? (
+                      <button
+                        onClick={handleCancelContinuousPrint}
+                        disabled={continuousJob.cancelRequested || recipeBusy === 'cancelContinuous'}
+                        className="px-2.5 py-1.5 rounded bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 text-rose-300 disabled:opacity-50 flex items-center gap-1.5"
+                      >
+                        {recipeBusy === 'cancelContinuous' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}
+                        {continuousJob.cancelRequested ? 'Stopping' : 'Stop'}
+                      </button>
+                    ) : (
+                      <span className={`font-mono uppercase text-[10px] ${continuousJob.status === 'completed' ? 'text-emerald-300' : continuousJob.status === 'failed' ? 'text-rose-300' : 'text-amber-300'}`}>
+                        {continuousJob.status}
+                      </span>
+                    )}
+                  </div>
+                  <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-cyan-500 transition-[width] duration-300"
+                      style={{ width: `${continuousJob.requested ? Math.min(100, (continuousJob.processed / continuousJob.requested) * 100) : 0}%` }}
+                    />
+                  </div>
+                  <div className="flex gap-4 font-mono text-[11px]">
+                    <span className="text-emerald-300">Printed {continuousJob.printed}</span>
+                    <span className={continuousJob.failed ? 'text-rose-300' : 'text-slate-500'}>Failed {continuousJob.failed}</span>
+                  </div>
+                </div>
+              )}
 
               {selectedRecipeDetail && (
                 <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-3">

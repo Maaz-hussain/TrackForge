@@ -909,6 +909,25 @@ let pipelineState: ScanToPrintPipeline = {
   totalFiltered: 0,
 };
 
+type ContinuousPrintJob = {
+  id: string;
+  recipeId: number;
+  recipeName: string;
+  status: 'running' | 'completed' | 'cancelled' | 'failed';
+  requested: number;
+  processed: number;
+  printed: number;
+  failed: number;
+  printsPerSecond: number;
+  startedAt: number;
+  completedAt?: number;
+  currentSerial?: string;
+  cancelRequested: boolean;
+  error?: string;
+};
+
+let continuousPrintJob: ContinuousPrintJob | null = null;
+
 // Sockets
 let cognexSocket: net.Socket | null = null;
 let cognexTelnetBuffer = Buffer.alloc(0);
@@ -1397,6 +1416,93 @@ async function updatePrinterDynamicFields(input: any) {
     })),
     error: rejected ? rejected.result.data?.descript || 'The printer rejected the dynamic data.' : undefined,
   };
+}
+
+function waitFor(milliseconds: number) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function resetPendingContinuousSerials(serials: any[]) {
+  if (serials.length === 0) return;
+  const ids = serials.map((serial) => Number(serial.id));
+  const placeholders = ids.map(() => '?').join(',');
+  await getMysqlPool().query(
+    `UPDATE printer_recipe_serials
+     SET print_status = 'generated'
+     WHERE id IN (${placeholders}) AND print_status = 'printing_pending'`,
+    ids,
+  );
+}
+
+async function runContinuousPrintJob(
+  job: ContinuousPrintJob,
+  recipe: any,
+  serials: any[],
+  fieldOverrides: Record<string, any>,
+  printMode: string,
+) {
+  const pool = getMysqlPool();
+  const intervalMs = 1000 / job.printsPerSecond;
+  let lastDispatchAt = 0;
+
+  try {
+    for (let index = 0; index < serials.length; index += 1) {
+      const serial = serials[index];
+      const waitMs = lastDispatchAt ? (lastDispatchAt + intervalMs) - Date.now() : 0;
+      if (waitMs > 0) await waitFor(waitMs);
+
+      if (job.cancelRequested) {
+        await resetPendingContinuousSerials(serials.slice(index));
+        job.status = 'cancelled';
+        break;
+      }
+
+      lastDispatchAt = Date.now();
+      job.currentSerial = serial.serialValue;
+      const completeCode = buildCompleteRecipeCode(recipe, serial.serialValue, fieldOverrides);
+      const fields = buildRecipePrintFields(recipe, serial.serialValue, fieldOverrides);
+      try {
+        const result = await updatePrinterDynamicFields({
+          messageId: recipe.messageId,
+          messageName: recipe.messageName,
+          printMode,
+          fields,
+        });
+        if (result.ok) {
+          await pool.query(
+            "UPDATE printer_recipe_serials SET print_status = 'printed', printer_response = ?, printed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [JSON.stringify(result), serial.id],
+          );
+          job.printed += 1;
+        } else {
+          await pool.query(
+            "UPDATE printer_recipe_serials SET print_status = 'failed', printer_response = ?, error_message = ? WHERE id = ?",
+            [JSON.stringify(result), result.error || 'Printer rejected recipe fields.', serial.id],
+          );
+          job.failed += 1;
+        }
+      } catch (error: any) {
+        await pool.query(
+          "UPDATE printer_recipe_serials SET print_status = 'failed', error_message = ? WHERE id = ?",
+          [error.message, serial.id],
+        );
+        job.failed += 1;
+      }
+      job.processed += 1;
+      addPrinterLog('system', `Continuous print ${job.processed}/${job.requested}: ${completeCode}`);
+    }
+
+    if (job.status === 'running') job.status = 'completed';
+  } catch (error: any) {
+    job.status = 'failed';
+    job.error = error.message;
+    await resetPendingContinuousSerials(serials.slice(job.processed)).catch(() => undefined);
+    addPrinterLog('error', `Continuous print job ${job.id} failed: ${error.message}`);
+  } finally {
+    job.currentSerial = undefined;
+    job.completedAt = Date.now();
+    addPrinterLog('system', `Continuous print job ${job.id} ${job.status}: ${job.printed} printed, ${job.failed} failed.`);
+  }
 }
 
 // Execute Scan to Print workflow
@@ -2285,43 +2391,93 @@ app.post('/api/printer/recipes/:id/print-batch', async (req, res) => {
     const pool = getMysqlPool();
     const results = [];
     const useExistingOnly = req.body?.useExistingOnly === true;
+    const continuousPrint = req.body?.continuousPrint === true;
+    const requestedPrintRate = Number(req.body?.printsPerSecond || 1);
+    const printsPerSecond = Number.isFinite(requestedPrintRate)
+      ? Math.min(50, Math.max(1, requestedPrintRate))
+      : 1;
+    const fieldOverrides = req.body?.fieldOverrides || {};
+    const printMode = req.body?.printMode || 'single';
 
-    const [existingGenerated] = await pool.query<any[]>(
-      `SELECT
-        id,
-        serial_value AS serialValue,
-        uuid_value AS uuid,
-        gtin_part AS gtinPart,
-        complete_code AS completeCode,
-        print_status AS printStatus,
-        verification_status AS verificationStatus
-      FROM printer_recipe_serials
-      WHERE recipe_id = ? AND print_status = 'generated'
-      ORDER BY id
-      LIMIT ?`,
-      [recipeId, quantity],
-    );
-    const serialsToPrint = [...existingGenerated];
-    while (!useExistingOnly && serialsToPrint.length < quantity) {
-      serialsToPrint.push(await createRecipeSerial(recipe, undefined, req.body?.fieldOverrides || {}));
+    if (continuousPrint && continuousPrintJob?.status === 'running') {
+      res.status(409).json({ ok: false, error: 'A continuous print job is already running.', job: continuousPrintJob });
+      return;
     }
-    if (useExistingOnly && serialsToPrint.length < quantity) {
-      addPrinterLog('system', `Only ${serialsToPrint.length} generated serials available for recipe ${recipeId}; not generating new serials because useExistingOnly=true.`);
+
+    let serialsToPrint: any[] = [];
+    if (continuousPrint) {
+      for (let index = 0; index < quantity; index += 1) {
+        serialsToPrint.push(await createRecipeSerial(recipe, undefined, fieldOverrides));
+      }
+    } else {
+      const [existingGenerated] = await pool.query<any[]>(
+        `SELECT
+          id,
+          serial_value AS serialValue,
+          uuid_value AS uuid,
+          gtin_part AS gtinPart,
+          complete_code AS completeCode,
+          print_status AS printStatus,
+          verification_status AS verificationStatus
+        FROM printer_recipe_serials
+        WHERE recipe_id = ? AND print_status = 'generated'
+        ORDER BY id
+        LIMIT ?`,
+        [recipeId, quantity],
+      );
+      serialsToPrint = [...existingGenerated];
+      while (!useExistingOnly && serialsToPrint.length < quantity) {
+        serialsToPrint.push(await createRecipeSerial(recipe, undefined, fieldOverrides));
+      }
+      if (useExistingOnly && serialsToPrint.length < quantity) {
+        addPrinterLog('system', `Only ${serialsToPrint.length} generated serials available for recipe ${recipeId}; not generating new serials because useExistingOnly=true.`);
+      }
+    }
+
+    if (continuousPrint) {
+      const serialIds = serialsToPrint.map((serial) => Number(serial.id));
+      const placeholders = serialIds.map(() => '?').join(',');
+      await pool.query(
+        `UPDATE printer_recipe_serials SET print_status = 'printing_pending' WHERE id IN (${placeholders})`,
+        serialIds,
+      );
+      await pool.query('UPDATE printer_recipes SET is_active = 0');
+      await pool.query('UPDATE printer_recipes SET is_active = 1 WHERE id = ?', [recipeId]);
+      printerState.config.messageName = recipe.messageName;
+      printerState.config.dynamicFieldName = recipe.fields.find((field: any) => field.mode === 'serial')?.fieldName || printerState.config.dynamicFieldName;
+
+      const job: ContinuousPrintJob = {
+        id: `continuous_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
+        recipeId,
+        recipeName: recipe.name,
+        status: 'running',
+        requested: serialsToPrint.length,
+        processed: 0,
+        printed: 0,
+        failed: 0,
+        printsPerSecond,
+        startedAt: Date.now(),
+        cancelRequested: false,
+      };
+      continuousPrintJob = job;
+      void runContinuousPrintJob(job, recipe, serialsToPrint, fieldOverrides, printMode);
+      res.status(202).json({ ok: true, continuous: true, job });
+      return;
     }
 
     for (const serial of serialsToPrint) {
-      const completeCode = buildCompleteRecipeCode(recipe, serial.serialValue, req.body?.fieldOverrides || {});
+      const completeCode = buildCompleteRecipeCode(recipe, serial.serialValue, fieldOverrides);
       await pool.query(
         "UPDATE printer_recipe_serials SET complete_code = ?, print_status = 'printing_pending' WHERE id = ?",
         [completeCode, serial.id],
       );
 
-      const fields = buildRecipePrintFields(recipe, serial.serialValue, req.body?.fieldOverrides || {});
+      const fields = buildRecipePrintFields(recipe, serial.serialValue, fieldOverrides);
       try {
         const result = await updatePrinterDynamicFields({
           messageId: recipe.messageId,
           messageName: recipe.messageName,
-          printMode: req.body?.printMode || 'single',
+          printMode,
           fields,
         });
         if (result.ok) {
@@ -2362,6 +2518,19 @@ app.post('/api/printer/recipes/:id/print-batch', async (req, res) => {
     addPrinterLog('error', err.message);
     res.status(502).json({ ok: false, error: err.message });
   }
+});
+
+app.get('/api/printer/continuous-job', (req, res) => {
+  res.json({ ok: true, job: continuousPrintJob });
+});
+
+app.post('/api/printer/continuous-job/cancel', (req, res) => {
+  if (!continuousPrintJob || continuousPrintJob.status !== 'running') {
+    res.status(409).json({ ok: false, error: 'No continuous print job is running.', job: continuousPrintJob });
+    return;
+  }
+  continuousPrintJob.cancelRequested = true;
+  res.json({ ok: true, job: continuousPrintJob });
 });
 
 app.post('/api/printer/command', async (req, res) => {
